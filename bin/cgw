@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="cgw"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway-switcher"
+PROFILES_DIR="$CONFIG_DIR/profiles"
+ACTIVE_FILE="$CONFIG_DIR/active"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+
+mkdir -p "$PROFILES_DIR"
+chmod 700 "$CONFIG_DIR" "$PROFILES_DIR" 2>/dev/null || true
+
+err() { printf 'cgw: %s\n' "$*" >&2; }
+info() { printf '%s\n' "$*"; }
+mask_secret() {
+  local s="${1:-}"
+  if (( ${#s} <= 8 )); then printf '********'; else printf '%s…%s' "${s:0:4}" "${s: -4}"; fi
+}
+
+usage() {
+  cat <<'TXT'
+Claude Gateway Switcher (cgw)
+
+Usage:
+  cgw                      Run Claude with the active profile
+  cgw setup [name]         Create a profile interactively
+  cgw edit [name]          Edit a profile interactively
+  cgw use <name>           Make a profile active
+  cgw list                 List profiles
+  cgw show [name]          Show a profile (API key masked)
+  cgw models [name]        Ask gateway for /v1/models (requires curl)
+  cgw doctor [name]        Check Claude, profile, URL and common conflicts
+  cgw run [name] -- [args] Run Claude with a profile and extra Claude args
+  cgw delete <name>        Delete a profile
+  cgw help                 Show this help
+
+Profiles are stored in:
+  ~/.config/claude-gateway-switcher/profiles/
+with permissions restricted to the current user.
+TXT
+}
+
+sanitize_name() {
+  local n="$1"
+  [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || { err "profile name may contain only letters, numbers, dot, underscore and dash"; exit 2; }
+  printf '%s' "$n"
+}
+
+profile_path() { printf '%s/%s.conf' "$PROFILES_DIR" "$(sanitize_name "$1")"; }
+active_name() { [[ -f "$ACTIVE_FILE" ]] && tr -d '\r' < "$ACTIVE_FILE" || true; }
+
+load_profile() {
+  local name="$1" path
+  path="$(profile_path "$name")"
+  [[ -f "$path" ]] || { err "profile '$name' not found"; exit 3; }
+  # Profiles are generated only by cgw using shell-safe printf %q.
+  # shellcheck disable=SC1090
+  source "$path"
+  # Tolerate CRLF if a profile was hand-edited on Windows.
+  BASE_URL="${BASE_URL%$'\r'}"; MODEL_ID="${MODEL_ID%$'\r'}"
+  AUTH_TYPE="${AUTH_TYPE%$'\r'}"; API_KEY="${API_KEY%$'\r'}"; DISCOVERY="${DISCOVERY%$'\r'}"
+  : "${BASE_URL:?missing BASE_URL in profile}"
+  : "${MODEL_ID:?missing MODEL_ID in profile}"
+  : "${AUTH_TYPE:?missing AUTH_TYPE in profile}"
+  : "${API_KEY:?missing API_KEY in profile}"
+}
+
+write_profile() {
+  local name="$1" base_url="$2" auth_type="$3" api_key="$4" model_id="$5" discovery="$6" path tmp
+  path="$(profile_path "$name")"
+  tmp="$(mktemp "$PROFILES_DIR/.tmp.XXXXXX")"
+  chmod 600 "$tmp"
+  {
+    printf 'BASE_URL=%q\n' "$base_url"
+    printf 'AUTH_TYPE=%q\n' "$auth_type"
+    printf 'API_KEY=%q\n' "$api_key"
+    printf 'MODEL_ID=%q\n' "$model_id"
+    printf 'DISCOVERY=%q\n' "$discovery"
+  } > "$tmp"
+  mv "$tmp" "$path"
+  chmod 600 "$path"
+}
+
+prompt_default() {
+  local label="$1" default="$2" out
+  if [[ -n "$default" ]]; then
+    read -r -p "$label [$default]: " out
+    printf '%s' "${out:-$default}"
+  else
+    read -r -p "$label: " out
+    printf '%s' "$out"
+  fi
+}
+
+wizard() {
+  local name="$1" mode="${2:-setup}"
+  local old_base="" old_auth="bearer" old_key="" old_model="" old_discovery="0"
+  local path
+  path="$(profile_path "$name")"
+
+  if [[ "$mode" == "edit" ]]; then
+    [[ -f "$path" ]] || { err "profile '$name' not found"; exit 3; }
+    load_profile "$name"
+    old_base="$BASE_URL"; old_auth="$AUTH_TYPE"; old_key="$API_KEY"; old_model="$MODEL_ID"; old_discovery="${DISCOVERY:-0}"
+  elif [[ -f "$path" ]]; then
+    err "profile '$name' already exists; use: cgw edit $name"
+    exit 4
+  fi
+
+  info ""
+  info "Configuring profile: $name"
+  local base_url auth_choice auth_type model_id discovery api_key key_prompt
+  base_url="$(prompt_default 'Gateway base URL (no trailing /v1)' "$old_base")"
+  base_url="${base_url%/}"
+
+  local auth_default="1"
+  [[ "$old_auth" == "x-api-key" ]] && auth_default="2"
+  read -r -p "Auth type: 1) Bearer token  2) x-api-key [$auth_default]: " auth_choice
+  auth_choice="${auth_choice:-$auth_default}"
+  case "$auth_choice" in
+    1) auth_type="bearer" ;;
+    2) auth_type="x-api-key" ;;
+    *) err "invalid auth type"; exit 2 ;;
+  esac
+
+  if [[ -n "$old_key" ]]; then
+    read -r -s -p "API key [press Enter to keep current]: " api_key; printf '\n'
+    api_key="${api_key:-$old_key}"
+  else
+    read -r -s -p "API key: " api_key; printf '\n'
+  fi
+  [[ -n "$api_key" ]] || { err "API key cannot be empty"; exit 2; }
+
+  model_id="$(prompt_default 'Model ID' "$old_model")"
+  [[ -n "$model_id" ]] || { err "Model ID cannot be empty"; exit 2; }
+
+  local disc_default="n"
+  [[ "$old_discovery" == "1" ]] && disc_default="y"
+  read -r -p "Enable gateway model discovery for /model? [y/N] [$disc_default]: " discovery
+  discovery="${discovery:-$disc_default}"
+  case "${discovery,,}" in y|yes) discovery="1" ;; *) discovery="0" ;; esac
+
+  write_profile "$name" "$base_url" "$auth_type" "$api_key" "$model_id" "$discovery"
+  if [[ ! -f "$ACTIVE_FILE" ]]; then
+    printf '%s\n' "$name" > "$ACTIVE_FILE"
+    chmod 600 "$ACTIVE_FILE"
+  fi
+  info "Saved profile '$name'."
+  info "Use it with: cgw use $name"
+  info "Run Claude with: cgw"
+}
+
+select_profile() {
+  local requested="${1:-}" name
+  if [[ -n "$requested" ]]; then name="$requested"; else name="$(active_name)"; fi
+  [[ -n "$name" ]] || { err "no active profile. Run: cgw setup default"; exit 3; }
+  printf '%s' "$name"
+}
+
+apply_env() {
+  local name="$1"
+  load_profile "$name"
+  export ANTHROPIC_BASE_URL="$BASE_URL"
+  export ANTHROPIC_MODEL="$MODEL_ID"
+  unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY || true
+  if [[ "$AUTH_TYPE" == "bearer" ]]; then
+    export ANTHROPIC_AUTH_TOKEN="$API_KEY"
+  else
+    export ANTHROPIC_API_KEY="$API_KEY"
+  fi
+  if [[ "${DISCOVERY:-0}" == "1" ]]; then
+    export CLAUDE_CODE_USE_GATEWAY=1
+    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+  else
+    unset CLAUDE_CODE_USE_GATEWAY CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY || true
+  fi
+}
+
+run_claude() {
+  local name="$1"; shift
+  command -v "$CLAUDE_BIN" >/dev/null 2>&1 || { err "Claude Code not found in PATH. Install Claude Code first or set CLAUDE_BIN."; exit 127; }
+  apply_env "$name"
+  exec "$CLAUDE_BIN" --model "$MODEL_ID" "$@"
+}
+
+cmd_list() {
+  local active="$(active_name)" found=0 f n
+  shopt -s nullglob
+  for f in "$PROFILES_DIR"/*.conf; do
+    found=1; n="$(basename "$f" .conf)"
+    if [[ "$n" == "$active" ]]; then printf '* %s\n' "$n"; else printf '  %s\n' "$n"; fi
+  done
+  (( found )) || info "No profiles. Run: cgw setup default"
+}
+
+cmd_show() {
+  local name="$(select_profile "${1:-}")"
+  load_profile "$name"
+  printf 'Profile:   %s\n' "$name"
+  printf 'Base URL:  %s\n' "$BASE_URL"
+  printf 'Auth:      %s\n' "$AUTH_TYPE"
+  printf 'API key:   %s\n' "$(mask_secret "$API_KEY")"
+  printf 'Model:     %s\n' "$MODEL_ID"
+  printf 'Discovery: %s\n' "${DISCOVERY:-0}"
+}
+
+cmd_models() {
+  local name="$(select_profile "${1:-}")"
+  command -v curl >/dev/null 2>&1 || { err "curl is required for 'cgw models'"; exit 127; }
+  load_profile "$name"
+  local -a hdr=(-H 'accept: application/json')
+  if [[ "$AUTH_TYPE" == "bearer" ]]; then hdr+=(-H "Authorization: Bearer $API_KEY"); else hdr+=(-H "x-api-key: $API_KEY"); fi
+  curl -fsS "${BASE_URL%/}/v1/models" "${hdr[@]}"
+  printf '\n'
+}
+
+cmd_doctor() {
+  local name="$(select_profile "${1:-}")" ok=1
+  info "Profile: $name"
+  if command -v "$CLAUDE_BIN" >/dev/null 2>&1; then info "[ok] Claude Code: $(command -v "$CLAUDE_BIN")"; else info "[!!] Claude Code not found"; ok=0; fi
+  load_profile "$name"
+  [[ "$BASE_URL" =~ ^https?:// ]] && info "[ok] Base URL format" || { info "[!!] Base URL should start with http:// or https://"; ok=0; }
+  [[ -n "$MODEL_ID" ]] && info "[ok] Model ID: $MODEL_ID" || { info "[!!] Model ID empty"; ok=0; }
+  [[ -n "$API_KEY" ]] && info "[ok] API key present ($(mask_secret "$API_KEY"))" || { info "[!!] API key missing"; ok=0; }
+  local path="$(profile_path "$name")" perms
+  perms="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
+  [[ "$perms" == "600" ]] && info "[ok] Profile permissions: 600" || info "[warn] Profile permissions are '$perms' (recommended: 600)"
+  if [[ -f "$HOME/.claude/settings.json" ]] && grep -Eq '"model"[[:space:]]*:' "$HOME/.claude/settings.json"; then
+    info "[warn] ~/.claude/settings.json contains a top-level model setting; some Claude Code versions have had precedence bugs."
+  fi
+  (( ok ))
+}
+
+cmd="${1:-run-active}"
+case "$cmd" in
+  setup)
+    wizard "$(sanitize_name "${2:-default}")" setup
+    ;;
+  edit)
+    wizard "$(sanitize_name "${2:-$(active_name)}")" edit
+    ;;
+  use)
+    [[ -n "${2:-}" ]] || { err "usage: cgw use <name>"; exit 2; }
+    name="$(sanitize_name "$2")"
+    [[ -f "$(profile_path "$name")" ]] || { err "profile '$name' not found"; exit 3; }
+    printf '%s\n' "$name" > "$ACTIVE_FILE"; chmod 600 "$ACTIVE_FILE"; info "Active profile: $name"
+    ;;
+  list) cmd_list ;;
+  show) cmd_show "${2:-}" ;;
+  models) cmd_models "${2:-}" ;;
+  doctor) cmd_doctor "${2:-}" ;;
+  delete)
+    [[ -n "${2:-}" ]] || { err "usage: cgw delete <name>"; exit 2; }
+    name="$(sanitize_name "$2")"; rm -f "$(profile_path "$name")"
+    [[ "$(active_name)" == "$name" ]] && rm -f "$ACTIVE_FILE"
+    info "Deleted profile '$name'."
+    ;;
+  run)
+    shift
+    name=""
+    if [[ "${1:-}" != "--" && -n "${1:-}" ]]; then name="$1"; shift; fi
+    [[ "${1:-}" == "--" ]] && shift
+    name="$(select_profile "$name")"
+    run_claude "$name" "$@"
+    ;;
+  help|-h|--help) usage ;;
+  run-active)
+    name="$(select_profile '')"; run_claude "$name"
+    ;;
+  *)
+    # Treat unknown first args as Claude args when a profile is active, e.g. cgw -p "hello"
+    name="$(select_profile '')"; run_claude "$name" "$@"
+    ;;
+esac
