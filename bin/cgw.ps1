@@ -7,6 +7,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Script:ClaudeBin = if ($env:CLAUDE_BIN) { $env:CLAUDE_BIN } else { 'claude' }
+$Script:DefaultBaseUrl = 'http://localhost:20128/v1'
 if ($env:XDG_CONFIG_HOME) { $Script:ConfigDir = Join-Path $env:XDG_CONFIG_HOME 'claude-gateway-switcher' }
 elseif ($env:APPDATA) { $Script:ConfigDir = Join-Path $env:APPDATA 'claude-gateway-switcher' }
 else { $Script:ConfigDir = Join-Path $HOME '.config/claude-gateway-switcher' }
@@ -112,9 +113,11 @@ function Read-Profile([string]$Name) {
   foreach ($line in [System.IO.File]::ReadAllLines($path)) {
     if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $p[$Matches[1]] = Unquote-BashValue $Matches[2] }
   }
-  foreach ($k in @('BASE_URL', 'MODEL_ID', 'AUTH_TYPE', 'API_KEY')) {
+  foreach ($k in @('BASE_URL', 'MODEL_ID')) {
     if ([string]::IsNullOrEmpty($p[$k])) { Fail "profile '$Name' is missing $k" 3 }
   }
+  if ([string]::IsNullOrEmpty($p['AUTH_TYPE'])) { $p['AUTH_TYPE'] = 'none' }
+  if ($null -eq $p['API_KEY']) { $p['API_KEY'] = '' }
   if ($null -eq $p['DISCOVERY']) { $p['DISCOVERY'] = '0' }
   return $p
 }
@@ -163,7 +166,7 @@ function Read-ApiKey([string]$Prompt, [string]$Keep) {
 
 function Invoke-Wizard([string]$Name, [string]$Mode) {
   $path = Get-ProfilePath $Name
-  $oldBase = ''; $oldAuth = 'bearer'; $oldKey = ''; $oldModel = ''; $oldDisc = '0'
+  $oldBase = $Script:DefaultBaseUrl; $oldAuth = 'bearer'; $oldKey = ''; $oldModel = ''; $oldDisc = '0'
   if ($Mode -eq 'edit') {
     $p = Read-Profile $Name
     $oldBase = $p['BASE_URL']; $oldAuth = $p['AUTH_TYPE']; $oldKey = $p['API_KEY']
@@ -173,18 +176,23 @@ function Invoke-Wizard([string]$Name, [string]$Mode) {
   }
   Write-Host ''
   Write-Host "Configuring profile: $Name"
-  $baseUrl = (Prompt-Default 'Gateway base URL (no trailing /v1)' $oldBase).TrimEnd('/')
-  $authDefault = if ($oldAuth -eq 'x-api-key') { '2' } else { '1' }
-  $authChoice = Read-Host -Prompt "Auth type: 1) Bearer token  2) x-api-key [$authDefault]"
-  if ([string]::IsNullOrWhiteSpace($authChoice)) { $authChoice = $authDefault }
-  switch ($authChoice.Trim()) {
-    '1' { $authType = 'bearer' }
-    '2' { $authType = 'x-api-key' }
-    default { Fail 'invalid auth type' 2 }
+  $baseUrl = (Prompt-Default 'Gateway base URL (e.g. http://localhost:20128/v1)' $oldBase).TrimEnd('/')
+  while ($baseUrl.EndsWith('/v1')) { $baseUrl = $baseUrl.Substring(0, $baseUrl.Length - 3).TrimEnd('/') }
+  if ([string]::IsNullOrEmpty($baseUrl)) { Fail 'Base URL cannot be empty' 2 }
+  if ($oldKey) { $apiKey = Read-ApiKey 'API key [Enter to keep, - to clear]' $oldKey }
+  else { $apiKey = Read-ApiKey 'API key [optional, Enter to skip]' '' }
+  if ($apiKey -eq '-') { $apiKey = '' }
+  $authType = 'none'
+  if (-not [string]::IsNullOrEmpty($apiKey)) {
+    $authDefault = if ($oldAuth -eq 'x-api-key') { '2' } else { '1' }
+    $authChoice = Read-Host -Prompt "Auth type: 1) Bearer token  2) x-api-key [$authDefault]"
+    if ([string]::IsNullOrWhiteSpace($authChoice)) { $authChoice = $authDefault }
+    switch ($authChoice.Trim()) {
+      '1' { $authType = 'bearer' }
+      '2' { $authType = 'x-api-key' }
+      default { Fail 'invalid auth type' 2 }
+    }
   }
-  if ($oldKey) { $apiKey = Read-ApiKey 'API key [press Enter to keep current]' $oldKey }
-  else { $apiKey = Read-ApiKey 'API key' '' }
-  if ([string]::IsNullOrEmpty($apiKey)) { Fail 'API key cannot be empty' 2 }
   $modelId = Prompt-Default 'Model ID' $oldModel
   if ([string]::IsNullOrEmpty($modelId)) { Fail 'Model ID cannot be empty' 2 }
   $discDefault = if ($oldDisc -eq '1') { 'y' } else { 'n' }
@@ -207,8 +215,10 @@ function Invoke-Claude([string]$Name, [string[]]$ExtraArgs) {
   $env:ANTHROPIC_MODEL = $p['MODEL_ID']
   Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
   Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
-  if ($p['AUTH_TYPE'] -eq 'bearer') { $env:ANTHROPIC_AUTH_TOKEN = $p['API_KEY'] }
-  else { $env:ANTHROPIC_API_KEY = $p['API_KEY'] }
+  if (-not [string]::IsNullOrEmpty($p['API_KEY'])) {
+    if ($p['AUTH_TYPE'] -eq 'bearer') { $env:ANTHROPIC_AUTH_TOKEN = $p['API_KEY'] }
+    elseif ($p['AUTH_TYPE'] -eq 'x-api-key') { $env:ANTHROPIC_API_KEY = $p['API_KEY'] }
+  }
   if ($p['DISCOVERY'] -eq '1') {
     $env:CLAUDE_CODE_USE_GATEWAY = '1'
     $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'
@@ -254,7 +264,8 @@ switch ($cmd) {
     Write-Host "Profile:   $n"
     Write-Host "Base URL:  $($p['BASE_URL'])"
     Write-Host "Auth:      $($p['AUTH_TYPE'])"
-    Write-Host "API key:   $(Mask-Secret $p['API_KEY'])"
+    if ([string]::IsNullOrEmpty($p['API_KEY'])) { Write-Host 'API key:   (not set)' }
+    else { Write-Host "API key:   $(Mask-Secret $p['API_KEY'])" }
     Write-Host "Model:     $($p['MODEL_ID'])"
     Write-Host "Discovery: $($p['DISCOVERY'])"
   }
@@ -262,8 +273,10 @@ switch ($cmd) {
     $n = Select-Profile $(if ($rest.Count -ge 1) { $rest[0] } else { '' })
     $p = Read-Profile $n
     $headers = @{ accept = 'application/json' }
-    if ($p['AUTH_TYPE'] -eq 'bearer') { $headers['Authorization'] = "Bearer $($p['API_KEY'])" }
-    else { $headers['x-api-key'] = $p['API_KEY'] }
+    if (-not [string]::IsNullOrEmpty($p['API_KEY'])) {
+      if ($p['AUTH_TYPE'] -eq 'bearer') { $headers['Authorization'] = "Bearer $($p['API_KEY'])" }
+      elseif ($p['AUTH_TYPE'] -eq 'x-api-key') { $headers['x-api-key'] = $p['API_KEY'] }
+    }
     try {
       Invoke-RestMethod -Uri "$($p['BASE_URL'].TrimEnd('/'))/v1/models" -Headers $headers |
         ConvertTo-Json -Depth 10
@@ -282,7 +295,7 @@ switch ($cmd) {
     if ($p['MODEL_ID']) { Write-Host "[ok] Model ID: $($p['MODEL_ID'])" }
     else { Write-Host '[!!] Model ID empty'; $ok = $false }
     if ($p['API_KEY']) { Write-Host "[ok] API key present ($(Mask-Secret $p['API_KEY']))" }
-    else { Write-Host '[!!] API key missing'; $ok = $false }
+    else { Write-Host '[..] No API key set (connecting without auth)' }
     $homeDir = if ($HOME) { $HOME } else { $env:USERPROFILE }
     $settings = Join-Path (Join-Path $homeDir '.claude') 'settings.json'
     if ((Test-Path $settings) -and (Select-String -Path $settings -Pattern '"model"\s*:' -Quiet)) {

@@ -4,9 +4,9 @@ A tiny profile-based launcher for Claude Code + Anthropic-compatible gateways.
 
 It lets a user clone the repo, run one installer, enter:
 
-- Gateway base URL
-- API key
-- Auth type (`Bearer` or `x-api-key`)
+- Gateway base URL (default: `http://localhost:20128/v1`)
+- API key (optional, skipped with Enter)
+- Auth type (`Bearer` or `x-api-key`, only asked when a key is set)
 - Model ID
 - Optional gateway model discovery
 
@@ -110,19 +110,22 @@ all load in PowerShell.
 
 ## What gets exported when Claude starts
 
-Depending on the selected auth type, `cgw` exports:
+If no API key is set, `cgw` exports only:
 
 ```text
 ANTHROPIC_BASE_URL
 ANTHROPIC_MODEL
+```
+
+With a key, depending on the selected auth type it also exports:
+
+```text
 ANTHROPIC_AUTH_TOKEN   # Bearer mode
 ```
 
 or:
 
 ```text
-ANTHROPIC_BASE_URL
-ANTHROPIC_MODEL
 ANTHROPIC_API_KEY      # x-api-key mode
 ```
 

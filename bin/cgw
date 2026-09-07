@@ -6,6 +6,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-gateway-switcher"
 PROFILES_DIR="$CONFIG_DIR/profiles"
 ACTIVE_FILE="$CONFIG_DIR/active"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+DEFAULT_BASE_URL="http://localhost:20128/v1"
 
 mkdir -p "$PROFILES_DIR"
 chmod 700 "$CONFIG_DIR" "$PROFILES_DIR" 2>/dev/null || true
@@ -61,8 +62,9 @@ load_profile() {
   AUTH_TYPE="${AUTH_TYPE%$'\r'}"; API_KEY="${API_KEY%$'\r'}"; DISCOVERY="${DISCOVERY%$'\r'}"
   : "${BASE_URL:?missing BASE_URL in profile}"
   : "${MODEL_ID:?missing MODEL_ID in profile}"
-  : "${AUTH_TYPE:?missing AUTH_TYPE in profile}"
-  : "${API_KEY:?missing API_KEY in profile}"
+  AUTH_TYPE="${AUTH_TYPE:-none}"
+  API_KEY="${API_KEY:-}"
+  DISCOVERY="${DISCOVERY:-0}"
 }
 
 write_profile() {
@@ -94,7 +96,7 @@ prompt_default() {
 
 wizard() {
   local name="$1" mode="${2:-setup}"
-  local old_base="" old_auth="bearer" old_key="" old_model="" old_discovery="0"
+  local old_base="$DEFAULT_BASE_URL" old_auth="bearer" old_key="" old_model="" old_discovery="0"
   local path
   path="$(profile_path "$name")"
 
@@ -110,26 +112,32 @@ wizard() {
   info ""
   info "Configuring profile: $name"
   local base_url auth_choice auth_type model_id discovery api_key key_prompt
-  base_url="$(prompt_default 'Gateway base URL (no trailing /v1)' "$old_base")"
+  base_url="$(prompt_default 'Gateway base URL (e.g. http://localhost:20128/v1)' "$old_base")"
   base_url="${base_url%/}"
-
-  local auth_default="1"
-  [[ "$old_auth" == "x-api-key" ]] && auth_default="2"
-  read -r -p "Auth type: 1) Bearer token  2) x-api-key [$auth_default]: " auth_choice
-  auth_choice="${auth_choice:-$auth_default}"
-  case "$auth_choice" in
-    1) auth_type="bearer" ;;
-    2) auth_type="x-api-key" ;;
-    *) err "invalid auth type"; exit 2 ;;
-  esac
+  # Tolerate pasting the full URL with /v1; canonical form has no /v1 suffix.
+  while [[ "$base_url" == */v1 ]]; do base_url="${base_url%/v1}"; base_url="${base_url%/}"; done
+  [[ -n "$base_url" ]] || { err "Base URL cannot be empty"; exit 2; }
 
   if [[ -n "$old_key" ]]; then
-    read -r -s -p "API key [press Enter to keep current]: " api_key; printf '\n'
-    api_key="${api_key:-$old_key}"
+    read -r -s -p "API key [Enter to keep, - to clear]: " api_key; printf '\n'
+    if [[ -z "$api_key" ]]; then api_key="$old_key"
+    elif [[ "$api_key" == "-" ]]; then api_key=""; fi
   else
-    read -r -s -p "API key: " api_key; printf '\n'
+    read -r -s -p "API key [optional, Enter to skip]: " api_key; printf '\n'
   fi
-  [[ -n "$api_key" ]] || { err "API key cannot be empty"; exit 2; }
+
+  auth_type="none"
+  if [[ -n "$api_key" ]]; then
+    local auth_default="1"
+    [[ "$old_auth" == "x-api-key" ]] && auth_default="2"
+    read -r -p "Auth type: 1) Bearer token  2) x-api-key [$auth_default]: " auth_choice
+    auth_choice="${auth_choice:-$auth_default}"
+    case "$auth_choice" in
+      1) auth_type="bearer" ;;
+      2) auth_type="x-api-key" ;;
+      *) err "invalid auth type"; exit 2 ;;
+    esac
+  fi
 
   model_id="$(prompt_default 'Model ID' "$old_model")"
   [[ -n "$model_id" ]] || { err "Model ID cannot be empty"; exit 2; }
@@ -163,10 +171,12 @@ apply_env() {
   export ANTHROPIC_BASE_URL="$BASE_URL"
   export ANTHROPIC_MODEL="$MODEL_ID"
   unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY || true
-  if [[ "$AUTH_TYPE" == "bearer" ]]; then
-    export ANTHROPIC_AUTH_TOKEN="$API_KEY"
-  else
-    export ANTHROPIC_API_KEY="$API_KEY"
+  if [[ -n "${API_KEY:-}" ]]; then
+    if [[ "$AUTH_TYPE" == "bearer" ]]; then
+      export ANTHROPIC_AUTH_TOKEN="$API_KEY"
+    elif [[ "$AUTH_TYPE" == "x-api-key" ]]; then
+      export ANTHROPIC_API_KEY="$API_KEY"
+    fi
   fi
   if [[ "${DISCOVERY:-0}" == "1" ]]; then
     export CLAUDE_CODE_USE_GATEWAY=1
@@ -199,7 +209,7 @@ cmd_show() {
   printf 'Profile:   %s\n' "$name"
   printf 'Base URL:  %s\n' "$BASE_URL"
   printf 'Auth:      %s\n' "$AUTH_TYPE"
-  printf 'API key:   %s\n' "$(mask_secret "$API_KEY")"
+  if [[ -n "${API_KEY:-}" ]]; then printf 'API key:   %s\n' "$(mask_secret "$API_KEY")"; else printf 'API key:   (not set)\n'; fi
   printf 'Model:     %s\n' "$MODEL_ID"
   printf 'Discovery: %s\n' "${DISCOVERY:-0}"
 }
@@ -209,7 +219,9 @@ cmd_models() {
   command -v curl >/dev/null 2>&1 || { err "curl is required for 'cgw models'"; exit 127; }
   load_profile "$name"
   local -a hdr=(-H 'accept: application/json')
-  if [[ "$AUTH_TYPE" == "bearer" ]]; then hdr+=(-H "Authorization: Bearer $API_KEY"); else hdr+=(-H "x-api-key: $API_KEY"); fi
+  if [[ -n "${API_KEY:-}" ]]; then
+    if [[ "$AUTH_TYPE" == "bearer" ]]; then hdr+=(-H "Authorization: Bearer $API_KEY"); elif [[ "$AUTH_TYPE" == "x-api-key" ]]; then hdr+=(-H "x-api-key: $API_KEY"); fi
+  fi
   curl -fsS "${BASE_URL%/}/v1/models" "${hdr[@]}"
   printf '\n'
 }
@@ -221,7 +233,7 @@ cmd_doctor() {
   load_profile "$name"
   [[ "$BASE_URL" =~ ^https?:// ]] && info "[ok] Base URL format" || { info "[!!] Base URL should start with http:// or https://"; ok=0; }
   [[ -n "$MODEL_ID" ]] && info "[ok] Model ID: $MODEL_ID" || { info "[!!] Model ID empty"; ok=0; }
-  [[ -n "$API_KEY" ]] && info "[ok] API key present ($(mask_secret "$API_KEY"))" || { info "[!!] API key missing"; ok=0; }
+  if [[ -n "${API_KEY:-}" ]]; then info "[ok] API key present ($(mask_secret "$API_KEY"))"; else info "[..] No API key set (connecting without auth)"; fi
   local path="$(profile_path "$name")" perms
   perms="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
   [[ "$perms" == "600" ]] && info "[ok] Profile permissions: 600" || info "[warn] Profile permissions are '$perms' (recommended: 600)"
