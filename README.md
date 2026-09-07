@@ -26,7 +26,7 @@ profiles can be copied between OSes.
 ### macOS / Linux / WSL
 
 ```bash
-git clone <YOUR_REPO_URL> claude-gateway-switcher
+git clone https://github.com/isina-nej/claude-gateway-switcher.git claude-gateway-switcher
 cd claude-gateway-switcher
 ./install.sh
 ```
@@ -36,7 +36,7 @@ The installer symlinks `bin/cgw` to `~/.local/bin/cgw`, so `git pull` updates th
 ### Windows (native PowerShell or CMD)
 
 ```powershell
-git clone <YOUR_REPO_URL> claude-gateway-switcher
+git clone https://github.com/isina-nej/claude-gateway-switcher.git claude-gateway-switcher
 cd claude-gateway-switcher
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
